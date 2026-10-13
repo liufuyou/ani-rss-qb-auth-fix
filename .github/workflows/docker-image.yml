@@ -1,0 +1,175 @@
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches: [main]
+    # 只改文档/License 时不触发构建（补丁文件与工作流改动仍会触发）
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+  schedule:
+    # 每周一次：UTC 周日 19:17 = 北京时间每周一 03:17
+    - cron: '17 19 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一时间只允许一个构建，新触发取消旧的
+concurrency:
+  group: build-image
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/liufuyou/ani-rss-qb-auth-fix
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone upstream
+        run: git clone --depth 1 https://github.com/wushuo894/ani-rss.git /tmp/upstream
+
+      - name: Get upstream commit
+        id: upstream
+        run: |
+          cd /tmp/upstream
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "上游最新 commit: $SHA"
+
+      - name: Skip if already built
+        id: skip
+        run: |
+          # 仅定时触发时跳过：上游没更新就不重复构建。
+          # push / 手动触发一律构建（补丁文件改过就必须重新出镜像）。
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "事件 ${{ github.event_name }}，不跳过"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TAG="upstream-${{ steps.upstream.outputs.sha }}"
+          # 用匿名 token 查 GHCR 标签列表
+          TOK=$(curl -s "https://ghcr.io/token?scope=repository:liufuyou/ani-rss-qb-auth-fix:pull" | jq -r .token)
+          EXISTS=$(curl -s -H "Authorization: Bearer $TOK" \
+            "https://ghcr.io/v2/liufuyou/ani-rss-qb-auth-fix/tags/list" \
+            | jq -r --arg t "$TAG" '.tags // [] | index($t) != null')
+          echo "exists=$EXISTS" >> "$GITHUB_OUTPUT"
+          if [ "$EXISTS" = "true" ]; then
+            echo "上游 ${{ steps.upstream.outputs.sha }} 已构建过，跳过本次"
+          fi
+
+      - name: Report upstream patch surface
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          echo "本镜像只覆盖下面两个文件，其余跟随上游："
+          FAIL=0
+          for p in \
+            "ani-rss-application/src/main/java/ani/rss/download/qBittorrent.java" \
+            "ani-rss-ui/src/view/config/DownloadView.vue" ; do
+            echo ""
+            echo "-- $p"
+            if [ -f "/tmp/upstream/$p" ]; then
+              echo "   存在 OK  上游 $(wc -l < "/tmp/upstream/$p") 行 / 补丁 $(wc -l < "$GITHUB_WORKSPACE/files/$(basename $p)") 行"
+              curl -s "https://api.github.com/repos/wushuo894/ani-rss/commits?path=$p&per_page=1" \
+                | jq -r '.[0] | "   上游最后修改：\(.commit.author.date)  \(.sha[0:7])  \(.commit.message | split("\n")[0])"' \
+                || echo "   （上游历史查询失败，不影响构建）"
+            else
+              echo "   ❌ 错误：上游已不存在该文件，补丁无处可覆盖"
+              FAIL=1
+            fi
+          done
+          # 注意：不能用 [ "$FAIL" = "1" ] && exit 1，bash -e 下 FAIL=0 时该行返回 1 会误判失败
+          if [ "$FAIL" = "1" ]; then
+            exit 1
+          fi
+
+      - name: Apply override files
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          cp files/qBittorrent.java /tmp/upstream/ani-rss-application/src/main/java/ani/rss/download/qBittorrent.java
+          cp files/DownloadView.vue /tmp/upstream/ani-rss-ui/src/view/config/DownloadView.vue
+
+      - name: Set up JDK 25
+        if: steps.skip.outputs.exists != 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Build jar
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          cd /tmp/upstream
+          mvn -B package -DskipTests -s "$GITHUB_WORKSPACE/settings.xml"
+
+      - name: Set up QEMU
+        if: steps.skip.outputs.exists != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.skip.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.skip.outputs.exists != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        if: steps.skip.outputs.exists != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=upstream-${{ steps.upstream.outputs.sha }}
+            type=raw,value={{date 'YYYY-MM-DD'}}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.description=ani-rss with qBittorrent username/password auth restored (patch-only build)
+
+      - name: Build image (no push)
+        if: steps.skip.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/upstream
+          file: /tmp/upstream/docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ani-rss-smoke:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        if: steps.skip.outputs.exists != 'true'
+        run: |
+          docker run -d --name smoke -p 7789:7789 ani-rss-smoke:latest
+          sleep 45
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7789/)
+          docker logs smoke 2>&1 | tee /tmp/smoke.log || true
+          docker rm -f smoke || true
+          if [ "$CODE" != "200" ]; then echo "冒烟测试失败 HTTP $CODE"; exit 1; fi
+          if grep -qi 'ERROR' /tmp/smoke.log; then echo "日志含 ERROR"; exit 1; fi
+          echo "冒烟测试通过 HTTP $CODE 无 ERROR"
+
+      - name: Build and push
+        if: steps.skip.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/upstream
+          file: /tmp/upstream/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

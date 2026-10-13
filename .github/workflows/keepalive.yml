@@ -1,0 +1,15 @@
+name: Keepalive
+
+# 每 60 天无新 commit 时 GitHub 会暂停定时任务。
+# 这个空跑的工作流本身即算「活动」，可重置计时器，不产生 commit。
+on:
+  schedule:
+    # UTC 周日 00:00 = 北京时间每周一 08:00（与主构建 03:17 错开）
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "keepalive"
